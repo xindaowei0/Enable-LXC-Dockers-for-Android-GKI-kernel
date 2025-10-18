@@ -1,0 +1,79 @@
+name: Build Android Kernels
+
+on:
+  workflow_dispatch
+  push:
+    branches: [ main, master ]
+
+env:
+  USE_CCACHE: 1
+  CCACHE_EXEC: /usr/bin/ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        device: [mondrian, vermeer, sheng]
+    name: Build Kernel for ${{ matrix.device }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies and ccache
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi make bc bison flex libssl-dev zip ccache
+        sudo apt-get install python-is-python3
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: kernel-${{ matrix.device }}
+
+    - name: Build kernel
+      run: |
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CCACHE_DIR=${{ github.workspace }}/.ccache
+        
+        # 此处假设你的内核配置文件（.config）已按设备存放在特定路径，或使用defconfig
+        # 例如：cp arch/arm64/configs/${matrix.device}_defconfig .config
+        # 以下为示例构建命令，请根据你的源码树结构调整
+        make O=out ${matrix.device}_defconfig
+        make -j$(nproc) O=out CROSS_COMPILE=aarch64-linux-gnu-
+        
+        # 假设构建产物为Image.gz-dtb，将其打包并以设备代号命名
+        mkdir -p build_artifacts/${{ matrix.device }}
+        cp out/arch/arm64/boot/Image.gz-dtb build_artifacts/${{ matrix.device }}/
+        cd build_artifacts/${{ matrix.device }}
+        zip -r ${{ matrix.device }}-kernel-$(date +%Y%m%d).zip .
+        cd ../..
+
+    - name: Upload kernel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-${{ matrix.device }}
+        path: build_artifacts/${{ matrix.device }}/*.zip
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/**/*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

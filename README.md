@@ -90,8 +90,8 @@ git clone https://github.com/TapetalArray/GKI-Custom
 Apply patches and configuration files
 
 ```bash
-cp ./GKI-Custom/config/gki_defconfig-android12-5.10 ./android-kernel/common/arch/arm64/configs/gki_defconfig
-cd android-kernel/common
+cp ./GKI-Custom/config/gki_defconfig-android12-5.10 ./gki-kernel-build/common/arch/arm64/configs/gki_defconfig
+cd gki-kernel-build/common
 git apply ../../GKI-Custom/patchs/*.patch
 ```
 

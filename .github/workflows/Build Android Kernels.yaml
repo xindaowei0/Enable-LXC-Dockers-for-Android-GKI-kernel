@@ -1,79 +1,105 @@
-name: Build Android Kernels
+name: Android12-5.10-自定义内核编译
 
-on:
-  workflow_dispatch
-  push:
-    branches: [ main, master ]
-
-env:
-  USE_CCACHE: 1
-  CCACHE_EXEC: /usr/bin/ccache
+on: 
+  workflow_dispatch:
+    inputs:
+      os_patch_level:
+        required: true
+        type: string
+        description: >
+          通用内核清单的补丁级别，
+          例如：2021-11
+      version_name:
+        required: true
+        type: string
+        description: >
+          内核版本（需包含SUBLEVEL），
+          例如：android12-5.10.66
+      custom:
+        required: true
+        type: boolean
+        description: >
+          启用LXC、Docker功能
+      kernelsu:
+        required: true
+        type: boolean
+        description: >
+          启用KernelSU功能
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        device: [mondrian, vermeer, sheng]
-    name: Build Kernel for ${{ matrix.device }}
-    
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.x'
-
-    - name: Install dependencies and ccache
+    - name: 安装依赖项
       run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi make bc bison flex libssl-dev zip ccache
-        sudo apt-get install python-is-python3
+        sudo apt install repo wget -y
 
-    - name: Set up ccache
-      uses: hendrikmuhs/ccache-action@v1.2
-      with:
-        key: kernel-${{ matrix.device }}
-
-    - name: Build kernel
+    - name: 同步内核源码
       run: |
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CCACHE_DIR=${{ github.workspace }}/.ccache
-        
-        # 此处假设你的内核配置文件（.config）已按设备存放在特定路径，或使用defconfig
-        # 例如：cp arch/arm64/configs/${matrix.device}_defconfig .config
-        # 以下为示例构建命令，请根据你的源码树结构调整
-        make O=out ${matrix.device}_defconfig
-        make -j$(nproc) O=out CROSS_COMPILE=aarch64-linux-gnu-
-        
-        # 假设构建产物为Image.gz-dtb，将其打包并以设备代号命名
-        mkdir -p build_artifacts/${{ matrix.device }}
-        cp out/arch/arm64/boot/Image.gz-dtb build_artifacts/${{ matrix.device }}/
-        cd build_artifacts/${{ matrix.device }}
-        zip -r ${{ matrix.device }}-kernel-$(date +%Y%m%d).zip .
-        cd ../..
+        cd $GITHUB_WORKSPACE
+        mkdir android-kernel
+        cd android-kernel
+        repo init --depth 1 -u https://android.googlesource.com/kernel/manifest -b common-${{ inputs.os_patch_level }}
+        repo sync
 
-    - name: Upload kernel artifact
+    - name: 应用补丁和配置文件
+      if: ${{ inputs.custom == true }}
+      run: |
+        cd $GITHUB_WORKSPACE
+        git clone https://github.com/TapetalArray/GKI-Custom.git gki-patch
+        cp ./gki-patch/config/gki_defconfig-android12-5.10 ./android-kernel/common/arch/arm64/configs/gki_defconfig
+        cd ./android-kernel/common
+        git apply $GITHUB_WORKSPACE/gki-patch/patchs/*.patch
+
+    - name: 集成KernelSU
+      if: ${{ inputs.kernelsu == true }}
+      run: |
+          cd $GITHUB_WORKSPACE/android-kernel
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+    - name: 编译内核
+      run: |
+        cd $GITHUB_WORKSPACE/android-kernel
+        BUILD_CONFIG=common/build.config.gki.aarch64 build/config.sh savedefconfig
+        LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+
+    - name: 准备产物文件
+      id: prepareArtifacts
+      run: |
+        cd $GITHUB_WORKSPACE
+        OUTDIR=android-kernel/out/android12-5.10/dist
+        mkdir output
+        cp $OUTDIR/Image ./output/
+        cp $OUTDIR/Image.lz4 ./output/
+        cp $OUTDIR/Image ./
+        gzip -n -k -f -9 Image >Image.gz
+        git clone https://github.com/Kernel-SU/AnyKernel3
+        rm -rf ./AnyKernel3/.git
+        cp $OUTDIR/Image ./AnyKernel3/
+        wget https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_r1.zip -O ./gki-kernel.zip
+        unzip -q ./gki-kernel.zip
+        rm ./gki-kernel.zip
+        cd $GITHUB_WORKSPACE/android-kernel
+        echo "解压boot镜像"
+        ./tools/mkbootimg/unpack_bootimg.py --boot_img $GITHUB_WORKSPACE/boot*.img
+        echo "编译boot.img镜像"
+        ./tools/mkbootimg/mkbootimg.py --header_version 4 --kernel out/android12-5.10/dist/Image --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level ${{ inputs.os_patch_level }} -o $GITHUB_WORKSPACE/output/${{ inputs.version_name }}_${{ inputs.os_patch_level }}-boot.img
+        echo "编译boot-lz4.img镜像"
+        ./tools/mkbootimg/mkbootimg.py --header_version 4 --kernel out/android12-5.10/dist/Image.lz4 --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level ${{ inputs.os_patch_level }} -o $GITHUB_WORKSPACE/output/${{ inputs.version_name }}_${{ inputs.os_patch_level }}-boot-lz4.img
+        echo "编译boot-gz.img镜像"
+        ./tools/mkbootimg/mkbootimg.py --header_version 4 --kernel $GITHUB_WORKSPACE/Image.gz --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level ${{ inputs.os_patch_level }} -o $GITHUB_WORKSPACE/output/${{ inputs.version_name }}_${{ inputs.os_patch_level }}-boot-gz.img
+
+    - name: 上传Image、Image.gz和boot.img文件
       uses: actions/upload-artifact@v4
       with:
-        name: kernel-${{ matrix.device }}
-        path: build_artifacts/${{ matrix.device }}/*.zip
+        name: 内核镜像-${{ inputs.version_name }}_${{ inputs.os_patch_level }}
+        path: ./output/*
 
-  create-release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-    
-    steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
+    - name: 上传AnyKernel3文件
+      uses: actions/upload-artifact@v4
       with:
-        files: artifacts/**/*.zip
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: AnyKernel3-${{ inputs.version_name }}_${{ inputs.os_patch_level }}
+        path: ./AnyKernel3/*

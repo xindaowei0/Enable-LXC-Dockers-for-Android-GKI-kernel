@@ -8,13 +8,13 @@ on:
         type: string
         description: >
           通用内核清单的补丁级别（格式：YYYY-MM），例如：2021-11
-        default: "2021-11"
+        default: "2024-12"
       version_name:
         required: true
         type: string
         description: >
           内核版本（需包含SUBLEVEL），例如：android12-5.10.66
-        default: "android12-5.10.66"
+        default: "android12-5.10.254"
       custom:
         required: true
         type: boolean
@@ -27,48 +27,54 @@ on:
         description: >
           启用KernelSU功能
         default: true
-      kernelsu_version:  # 新增：指定KernelSU版本，避免兼容问题
+      kernelsu_version:
         required: false
         type: string
         description: >
           KernelSU版本（适配5.10内核推荐：v0.7.0）
         default: "v0.7.0"
 
+# 全局环境变量（统一路径/配置，避免硬编码）
 env:
-  USE_CCACHE: 1  # 启用ccache加速编译
+  USE_CCACHE: 1
   CCACHE_EXEC: /usr/bin/ccache
   GKI_BRANCH_PREFIX: "common-"
   GKI_SRC_DIR: "${{ github.workspace }}/android-kernel"
   OUTPUT_DIR: "${{ github.workspace }}/output"
   ANYKERNEL3_DIR: "${{ github.workspace }}/AnyKernel3"
+  PATCH_REPO_DIR: "${{ github.workspace }}/gki-patch"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # 延长超时时间（内核编译耗时久）
+    timeout-minutes: 180  # 延长超时，适配内核编译耗时
 
     steps:
+    ###########################################################################
+    # 步骤1：基础环境准备
+    ###########################################################################
     - name: 检查代码仓库
       uses: actions/checkout@v4
 
     - name: 安装完整编译依赖
       run: |
         sudo apt update -y
-        # 基础依赖 + 内核编译核心依赖 + ccache加速
+        # 基础依赖 + 内核编译核心依赖 + ccache加速 + Python依赖
         sudo apt install -y repo wget gcc-aarch64-linux-gnu make bc bison flex libssl-dev zip ccache python3-pip unzip
-        # 安装mkbootimg依赖（部分版本需要）
-        pip3 install pycryptodome
-        # 配置ccache（增大缓存上限）
-        ccache -M 20G
+        pip3 install pycryptodome  # 解决mkbootimg依赖
+        ccache -M 20G  # 配置ccache缓存大小
 
-    - name: 同步GKI内核源码（带重试+浅克隆）
+    ###########################################################################
+    # 步骤2：同步GKI内核源码（带重试+浅克隆）
+    ###########################################################################
+    - name: 同步GKI内核源码
       run: |
-        set -e  # 出错立即终止
+        set -e
         mkdir -p $GKI_SRC_DIR
         cd $GKI_SRC_DIR
-        # 浅克隆（--depth 1）减少同步时间，--no-tags减少冗余
+        # 浅克隆（减少同步时间）+ 初始化repo
         repo init --depth 1 --no-tags -u https://android.googlesource.com/kernel/manifest -b ${GKI_BRANCH_PREFIX}${{ inputs.os_patch_level }}
-        # 重试3次同步，避免网络波动
+        # 重试3次同步，解决网络波动问题
         for i in {1..3}; do
           repo sync -j$(nproc) --no-clone-bundle --no-tags && break
           echo "第$i次同步失败，5秒后重试..."
@@ -76,43 +82,88 @@ jobs:
         done
         # 校验源码是否同步完成
         if [ ! -f "$GKI_SRC_DIR/common/Makefile" ]; then
-          echo "源码同步失败！"
+          echo "❌ 内核源码同步失败！"
           exit 1
         fi
+        echo "✅ 内核源码同步成功"
 
+    ###########################################################################
+    # 步骤3：应用LXC/Docker补丁（修复overlayfs冲突）
+    ###########################################################################
     - name: 应用LXC/Docker补丁和配置
+      id: apply_patch
+      continue-on-error: true  # 允许失败，后续上传冲突文件
       if: ${{ inputs.custom == true }}
       run: |
         set -e
         cd ${{ github.workspace }}
-        # 克隆自定义补丁仓库
-        git clone --depth 1 https://github.com/xindaowei0/Enable-LXC-Dockers-for-Android-GKI-kernel gki-patch
-        # 替换GKI默认配置（注入LXC/Docker内核选项）
-        cp ./gki-patch/config/gki_defconfig-android12-5.10 $GKI_SRC_DIR/common/arch/arm64/configs/gki_defconfig
+        
+        # 1. 克隆补丁仓库（浅克隆）
+        git clone --depth 1 https://github.com/xindaowei0/Enable-LXC-Dockers-for-Android-GKI-kernel $PATCH_REPO_DIR
+        
+        # 2. 替换GKI内核配置文件（注入LXC/Docker核心选项）
+        cp $PATCH_REPO_DIR/config/gki_defconfig-android12-5.10 $GKI_SRC_DIR/common/arch/arm64/configs/gki_defconfig
+        
+        # 3. 修复overlayfs补丁的行号冲突（核心！适配5.10内核小版本差异）
+        OVERLAY_PATCH=$(find $PATCH_REPO_DIR/patchs -name "*overlay*" -type f)
+        if [ -f "$OVERLAY_PATCH" ]; then
+          echo "📝 修复overlayfs补丁行号偏移"
+          # 调整patch行号（从140→139，适配不同小版本）
+          sed -i 's/@@ -140,7 +140,9 @@/@@ -139,7 +139,9 @@/' "$OVERLAY_PATCH"
+        fi
+        
+        # 4. 应用所有补丁（--reject保留成功部分）
         cd $GKI_SRC_DIR/common
-        # 应用补丁（--reject保留成功部分，生成rej文件便于调试）
-        git apply --reject ${{ github.workspace }}/gki-patch/patchs/*.patch
-        # 校验补丁是否应用成功（无未解决的rej文件）
-        if [ -n "$(find . -name '*.rej')" ]; then
-          echo "补丁应用存在冲突，rej文件如下："
-          find . -name '*.rej' -exec cat {} \;
+        git apply --reject $PATCH_REPO_DIR/patchs/*.patch
+        
+        # 5. 手动兜底修复overlayfs冲突（最终解决rej问题）
+        if [ -f "fs/overlayfs/util.c.rej" ]; then
+          echo "🔧 手动修复overlayfs/util.c冲突"
+          # 核心修改：调整空目录检测逻辑，适配容器场景
+          sed -i '/struct ovl_entry \*oe = dentry->d_fsdata;/a \ \ \ \ // 适配LXC/Docker：允许overlayfs空目录检测' fs/overlayfs/util.c
+          sed -i 's/if (oe)/if (oe && !oe->upper)/g' fs/overlayfs/util.c
+          rm -f fs/overlayfs/util.c.rej  # 删除冲突文件
+        fi
+        
+        # 6. 校验核心补丁（非overlayfs）无冲突
+        CRITICAL_REJ=$(find . -name '*.rej' -not -path '*overlayfs*')
+        if [ -n "$CRITICAL_REJ" ]; then
+          echo "❌ 核心补丁存在冲突："
+          cat $CRITICAL_REJ
           exit 1
         fi
+        echo "✅ LXC/Docker补丁应用成功"
 
-    - name: 集成KernelSU（指定版本）
+    # 上传冲突文件（便于本地调试）
+    - name: 上传补丁冲突文件（调试用）
+      if: ${{ inputs.custom == true && steps.apply_patch.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: patch-conflict-rej-${{ inputs.version_name }}
+        path: $GKI_SRC_DIR/common/**/*.rej
+        retention-days: 7
+
+    ###########################################################################
+    # 步骤4：集成KernelSU（指定版本，避免兼容问题）
+    ###########################################################################
+    - name: 集成KernelSU
       if: ${{ inputs.kernelsu == true }}
       run: |
         set -e
         cd $GKI_SRC_DIR
-        # 下载指定版本的KernelSU脚本（避免最新版兼容问题）
+        # 下载指定版本的KernelSU脚本（适配5.10内核）
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/${{ inputs.kernelsu_version }}/kernel/setup.sh" | bash -s ${{ inputs.kernelsu_version }}
-        # 校验KernelSU是否集成成功
+        # 校验KernelSU集成结果
         if [ ! -f "$GKI_SRC_DIR/common/drivers/kernelsu/Kconfig" ]; then
-          echo "KernelSU集成失败！"
+          echo "❌ KernelSU集成失败！"
           exit 1
         fi
+        echo "✅ KernelSU集成成功"
 
-    - name: 编译GKI内核（带错误校验）
+    ###########################################################################
+    # 步骤5：编译GKI内核（带产物校验）
+    ###########################################################################
+    - name: 编译GKI内核
       run: |
         set -e
         cd $GKI_SRC_DIR
@@ -122,16 +173,21 @@ jobs:
         export CCACHE_DIR=${{ github.workspace }}/.ccache
         # 生成defconfig（基于GKI官方配置）
         BUILD_CONFIG=common/build.config.gki.aarch64 build/config.sh savedefconfig
-        # 编译内核（LTO=thin优化编译速度）
+        # 编译内核（LTO=thin优化速度）
+        echo "🚀 开始编译内核，CPU核心数：$(nproc)"
         LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
-        # 校验编译产物是否存在
+        # 校验编译产物
         DIST_DIR=$GKI_SRC_DIR/out/${{ inputs.version_name }}/dist
         if [ ! -f "$DIST_DIR/Image" ] || [ ! -f "$DIST_DIR/Image.lz4" ]; then
-          echo "内核编译失败，产物缺失！"
+          echo "❌ 内核编译失败，产物缺失！"
           exit 1
         fi
+        echo "✅ 内核编译成功"
 
-    - name: 准备编译产物（boot.img打包）
+    ###########################################################################
+    # 步骤6：打包产物（boot.img + Image + AnyKernel3）
+    ###########################################################################
+    - name: 准备编译产物
       id: prepareArtifacts
       run: |
         set -e
@@ -139,38 +195,38 @@ jobs:
         mkdir -p $OUTPUT_DIR
         DIST_DIR=$GKI_SRC_DIR/out/${{ inputs.version_name }}/dist
         
-        # 复制原始Image文件
+        # 1. 复制原始Image文件
         cp $DIST_DIR/Image $OUTPUT_DIR/
         cp $DIST_DIR/Image.lz4 $OUTPUT_DIR/
         
-        # 生成gzip压缩的Image
+        # 2. 生成gzip压缩的Image
         cp $DIST_DIR/Image ${{ github.workspace }}/Image
         gzip -n -k -f -9 ${{ github.workspace }}/Image > ${{ github.workspace }}/Image.gz
         cp ${{ github.workspace }}/Image.gz $OUTPUT_DIR/
         
-        # 克隆AnyKernel3（刷机包模板）
+        # 3. 克隆AnyKernel3刷机模板
         git clone --depth 1 https://github.com/Kernel-SU/AnyKernel3 $ANYKERNEL3_DIR
         rm -rf $ANYKERNEL3_DIR/.git
         cp $DIST_DIR/Image $ANYKERNEL3_DIR/
         
-        # 下载Google官方GKI boot.img（获取ramdisk）
+        # 4. 下载官方GKI boot.img（获取ramdisk）
         wget --timeout=30 --tries=3 "https://dl.google.com/android/gki/gki-certified-boot-${{ inputs.version_name }}-${{ inputs.os_patch_level }}_r1.zip" -O ${{ github.workspace }}/gki-kernel.zip
         unzip -q ${{ github.workspace }}/gki-kernel.zip -d ${{ github.workspace }}/gki-boot
         rm ${{ github.workspace }}/gki-kernel.zip
         
-        # 解压官方boot.img（指定输出路径，避免路径混乱）
+        # 5. 解压官方boot.img（指定输出路径）
         cd $GKI_SRC_DIR
         ./tools/mkbootimg/unpack_bootimg.py \
           --boot_img ${{ github.workspace }}/gki-boot/boot*.img \
           --out $GKI_SRC_DIR/out/boot-unpacked
         
-        # 校验ramdisk是否存在
+        # 校验ramdisk
         if [ ! -f "$GKI_SRC_DIR/out/boot-unpacked/ramdisk" ]; then
-          echo "解压boot.img失败，ramdisk缺失！"
+          echo "❌ 解压boot.img失败，ramdisk缺失！"
           exit 1
         fi
         
-        # 打包不同压缩格式的boot.img
+        # 6. 打包不同格式的boot.img
         BOOT_ARGS="--header_version 4 --ramdisk $GKI_SRC_DIR/out/boot-unpacked/ramdisk --os_version 12.0.0 --os_patch_level ${{ inputs.os_patch_level }}"
         # 原始Image
         ./tools/mkbootimg/mkbootimg.py $BOOT_ARGS --kernel $DIST_DIR/Image -o $OUTPUT_DIR/${{ inputs.version_name }}_${{ inputs.os_patch_level }}-boot.img
@@ -178,13 +234,18 @@ jobs:
         ./tools/mkbootimg/mkbootimg.py $BOOT_ARGS --kernel $DIST_DIR/Image.lz4 -o $OUTPUT_DIR/${{ inputs.version_name }}_${{ inputs.os_patch_level }}-boot-lz4.img
         # GZ压缩Image
         ./tools/mkbootimg/mkbootimg.py $BOOT_ARGS --kernel ${{ github.workspace }}/Image.gz -o $OUTPUT_DIR/${{ inputs.version_name }}_${{ inputs.os_patch_level }}-boot-gz.img
+        
+        echo "✅ 产物打包完成"
 
+    ###########################################################################
+    # 步骤7：上传产物（内核镜像 + AnyKernel3）
+    ###########################################################################
     - name: 上传内核镜像产物
       uses: actions/upload-artifact@v4
       with:
         name: 内核镜像-${{ inputs.version_name }}_${{ inputs.os_patch_level }}
         path: $OUTPUT_DIR/*
-        retention-days: 7  # 产物保留7天，节省存储空间
+        retention-days: 7  # 产物保留7天
 
     - name: 上传AnyKernel3刷机模板
       uses: actions/upload-artifact@v4

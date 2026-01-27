@@ -71,7 +71,7 @@ Enable LXC, Docker support for GKI Kernel, everything comes from [Common-Android
 
 # Build
 
-If you don't want to build it yourself, you can jump to the [actions](https://github.com/TapetalArray/GKI-Custom/actions) to download or fork repo run a new workflow
+If you don't want to build it yourself, you can jump to the [actions](https://github.com/xindaowei0/GKI-Custom/actions) to download or fork repo run a new workflow
 
 Sync the kernel source code, build reference [KernelSU](https://kernelsu.org/guide/how-to-build.html)
 
@@ -84,7 +84,7 @@ repo sync
 Clone this repo
 
 ```bash
-git clone https://github.com/TapetalArray/GKI-Custom
+git clone https://github.com/xindaowei0/GKI-Custom
 ```
 
 Apply patches and configuration files
